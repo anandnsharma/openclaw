@@ -3,6 +3,7 @@ import { qaGatewayCleanupRuntimeEntrypoint } from "../../extensions/qa-lab/src/g
 import { cliCompactionBackendEntrypoints } from "../../src/agents/command/cli-compaction-runtime.test-support.ts";
 import { cronOwnerHardeningEntrypoints } from "../../src/cron/owner-hardening-runtime.test-support.ts";
 import { sessionTitleRetentionEntrypoints } from "../../src/gateway/session-title-retention.test-support.ts";
+import { triageTestRuntimeEntrypoints } from "../../src/infra/triage-runtime.test-support.ts";
 import { nodeHostConfigRuntimeEntrypoint } from "../../src/node-host/config-runtime.test-support.ts";
 import { persistenceRuntimeEntrypoint } from "../../src/skills/library/persistence-runtime.test-support.ts";
 import { stateLeaseProcessExitRuntimeEntrypoint } from "../../src/state/openclaw-state-lease-runtime.test-support.ts";
@@ -22,6 +23,7 @@ export const vitestWorkerBuildEntries = {
       persistenceRuntimeEntrypoint,
       qaGatewayCleanupRuntimeEntrypoint,
       stateLeaseProcessExitRuntimeEntrypoint,
+      ...Object.values(triageTestRuntimeEntrypoints),
     ].map((entry) => [
       entry.distWorkerPath.replace(/\.js$/u, ""),
       fileURLToPath(new URL(`./${entry.sourceWorkerName}.ts`, entry.currentModuleUrl)),
