@@ -12,7 +12,6 @@ import {
   resolveLaunchAgentEnvWrapperPath,
 } from "../../daemon/launchd-service-files.js";
 import { readGatewayServiceState, resolveGatewayService } from "../../daemon/service.js";
-import { defaultRuntime } from "../../runtime.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { mockProcessPlatform } from "../../test-utils/vitest-spies.js";
 import * as runtimeUtils from "../../utils.js";
@@ -68,6 +67,7 @@ const mocks = vi.hoisted(() => ({
     throw new Error("Unexpected config snapshot during preserved activation");
   }),
   error: vi.fn(),
+  exit: vi.fn(),
   log: vi.fn(),
   writeJson: vi.fn(),
   capability:
@@ -146,7 +146,12 @@ vi.mock("./update-command-config-snapshot.js", () => ({
 }));
 vi.mock("./restart-helper.js", () => ({ runRestartScript: mocks.script }));
 vi.mock("../../runtime.js", () => ({
-  defaultRuntime: { log: mocks.log, error: mocks.error, exit: vi.fn(), writeJson: mocks.writeJson },
+  defaultRuntime: {
+    log: mocks.log,
+    error: mocks.error,
+    exit: mocks.exit,
+    writeJson: mocks.writeJson,
+  },
 }));
 vi.mock("../daemon-cli/restart-health.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon-cli/restart-health.js")>()),
@@ -165,7 +170,7 @@ const writeConfig = (version: string) => writeRecoveryConfig(configPath, version
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  vi.mocked(defaultRuntime.exit).mockReset();
+  mocks.exit.mockReset();
   mockProcessPlatform("linux");
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-activation-")));
   vi.spyOn(os, "userInfo").mockReturnValue({ ...os.userInfo(), homedir: root });
