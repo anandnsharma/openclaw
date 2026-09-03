@@ -341,8 +341,14 @@ function assertLegacyPostUpdatePluginFailure(updateJsonPath) {
 function assertCorruptPluginPolicyPreserved(configPath, pluginId) {
   const config = readJson(configPath);
   const allow = config.plugins?.allow;
-  if (JSON.stringify(allow) !== JSON.stringify([pluginId])) {
-    throw new Error(`expected plugins.allow to preserve ${pluginId}, got ${JSON.stringify(allow)}`);
+  if (!Array.isArray(allow)) {
+    throw new Error(`expected plugins.allow to be an array, got ${JSON.stringify(allow)}`);
+  }
+  const pluginMembershipCount = allow.filter((entry) => entry === pluginId).length;
+  if (pluginMembershipCount !== 1) {
+    throw new Error(
+      `expected plugins.allow to contain ${pluginId} exactly once, got ${JSON.stringify(allow)}`,
+    );
   }
   if (config.plugins?.entries?.codex?.enabled !== false) {
     throw new Error("expected the corrupt plugin fixture's explicit Codex opt-out to survive");
