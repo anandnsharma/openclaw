@@ -2,7 +2,7 @@ import { vi } from "vitest";
 import type { ModelCatalogEntry } from "../../api/types.ts";
 import { createChatSubmissions } from "../../app/chat-submissions.ts";
 import type { UiSettings } from "../../app/settings.ts";
-import { createSessionCapability } from "../../lib/sessions/index.ts";
+import { createTestSessionCapability } from "../../lib/sessions/session-capability.test-support.ts";
 import {
   createGatewayRequestMock,
   createTestGatewayClient,
@@ -182,7 +182,7 @@ export function makeChatHost(
   };
   const sessions =
     hostOverrides.sessions ??
-    createSessionCapability({
+    createTestSessionCapability({
       snapshot: {
         client: host.client,
         phase: host.connected ? "connected" : "reconnecting",

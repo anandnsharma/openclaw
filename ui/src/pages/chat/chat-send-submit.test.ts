@@ -7,7 +7,7 @@ import {
   readStoredOutboxStore,
   storageTargetForGateway,
 } from "../../lib/chat/outbox-store.ts";
-import { createSessionCapability } from "../../lib/sessions/index.ts";
+import { createTestSessionCapability } from "../../lib/sessions/session-capability.test-support.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
 import {
   getChatAttachmentDataUrl,
@@ -101,7 +101,7 @@ function createImmediateCommandHost(
   overrides: Partial<ChatHost> = {},
 ): ChatHost {
   const host = {
-    sessions: createSessionCapability({
+    sessions: createTestSessionCapability({
       snapshot: { client: null, phase: "reconnecting", hello: null },
       subscribe: () => () => undefined,
       subscribeEvents: () => () => undefined,
