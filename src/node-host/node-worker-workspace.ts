@@ -184,10 +184,17 @@ function resolveArgumentPath(workspaceDir: string, arg: string): string | undefi
 function assertWorkspaceArgv(workspaceDir: string, argv: readonly string[]): void {
   // This private transport owns cwd and direct path operands; it is not the user-facing
   // system.run policy domain, so absolute/relative escapes must never cross its workspace.
+  const executable = path.basename(argv[0] ?? "");
   for (const [index, arg] of argv.entries()) {
     // Canonical workspace helpers travel as the source operand to `node -e`.
     // Treating JavaScript slash characters as host paths rejects the shipped scripts.
-    if (index > 0 && argv[index - 1] === "-e" && path.basename(argv[0] ?? "") === "node") {
+    const previous = argv[index - 1];
+    const isInlineSource =
+      (executable === "node" && previous === "-e") ||
+      (index === 2 &&
+        (executable === "sh" || executable === "bash" || executable === "zsh") &&
+        (previous === "-c" || previous === "-lc"));
+    if (isInlineSource) {
       continue;
     }
     const candidate = resolveArgumentPath(workspaceDir, arg);
@@ -730,3 +737,5 @@ export class NodeWorkerWorkspaceRuntime {
     }
   }
 }
+
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -625,6 +625,79 @@ describe("node-host worker supervisor commands", () => {
     });
   });
 
+  it.runIf(process.platform !== "win32").each(["-c", "-lc"])(
+    "accepts %s shell source containing path syntax",
+    async (flag) => {
+      const workspace = new NodeWorkerWorkspaceRuntime({
+        root: tempDirs.make("node-worker-workspace-shell-source-"),
+        env: { PATH: process.env.PATH },
+      });
+      const { result } = await invokePrivate({
+        command: NODE_WORKER_WORKSPACE_EXEC_COMMAND,
+        paramsJSON: JSON.stringify({
+          gatewayNamespace: "gateway-1",
+          environmentId: "environment-1",
+          sessionId: "session-1",
+          generation: 4,
+          argv: ["sh", flag, "/usr/bin/printf inline-source"],
+        }),
+        workspace,
+      });
+
+      expect(result?.ok).toBe(true);
+      expect(JSON.parse(result?.payloadJSON ?? "{}")).toMatchObject({
+        stdout: "inline-source",
+        code: 0,
+      });
+    },
+  );
+
+  it("still confines operands after inline shell source", async () => {
+    const workspace = new NodeWorkerWorkspaceRuntime({
+      root: tempDirs.make("node-worker-workspace-shell-operand-"),
+      env: { PATH: process.env.PATH },
+    });
+    const { result } = await invokePrivate({
+      command: NODE_WORKER_WORKSPACE_EXEC_COMMAND,
+      paramsJSON: JSON.stringify({
+        gatewayNamespace: "gateway-1",
+        environmentId: "environment-1",
+        sessionId: "session-1",
+        generation: 4,
+        argv: ["sh", "-c", "/usr/bin/printf inline-source", "../outside"],
+      }),
+      workspace,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_REQUEST" },
+    });
+  });
+
+  it("does not treat -c as inline source for non-shell executables", async () => {
+    const workspace = new NodeWorkerWorkspaceRuntime({
+      root: tempDirs.make("node-worker-workspace-non-shell-source-"),
+      env: { PATH: process.env.PATH },
+    });
+    const { result } = await invokePrivate({
+      command: NODE_WORKER_WORKSPACE_EXEC_COMMAND,
+      paramsJSON: JSON.stringify({
+        gatewayNamespace: "gateway-1",
+        environmentId: "environment-1",
+        sessionId: "session-1",
+        generation: 4,
+        argv: ["not-a-shell", "-c", "/usr/bin/printf inline-source"],
+      }),
+      workspace,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_REQUEST" },
+    });
+  });
+
   it("resets only the identity-derived workspace before running the initial command", async () => {
     const workspace = new NodeWorkerWorkspaceRuntime({
       root: tempDirs.make("node-worker-workspace-reset-"),
