@@ -26,7 +26,7 @@ title: "Retry policy"
 
 ### Model providers
 
-Embedded model runs use the [model failover controller](/concepts/model-failover#model-fallback) for transient retries. It honors provider pacing within one attempt budget and a fixed retry window; provider transports do not add their own transient retry loops. ChatGPT SSE errors preserve HTTP status and `Retry-After` together, so a transient HTTP response remains retryable even when its message or provider code is unfamiliar.
+Embedded model runs use the [model failover controller](/concepts/model-failover#model-fallback) for transient HTTP-response retries. It honors provider pacing within one attempt budget and a fixed retry window. ChatGPT SSE errors preserve HTTP status and `Retry-After` together, so a transient HTTP response remains retryable even when its message or provider code is unfamiliar. The ChatGPT transport separately reconnects once for `websocket_connection_limit_reached` before streaming; this is not an SSE HTTP-response retry.
 
 For SDK calls that retain internal retries, Stainless-based SDKs such as Anthropic and OpenAI can receive `retry-after-ms` or `retry-after` on retryable responses (`408`, `409`, `429`, and `5xx`). When that wait is longer than 60 seconds, OpenClaw injects `x-should-retry: false` so the SDK returns control promptly. Override this SDK-only cap with `OPENCLAW_SDK_RETRY_MAX_WAIT_SECONDS=<seconds>`. Set it to `0`, `false`, `off`, `none`, or `disabled` to let those SDK calls honor long `Retry-After` sleeps internally.
 
