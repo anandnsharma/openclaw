@@ -1,6 +1,6 @@
 // Plugin Update Unchanged Docker tests cover plugin update unchanged docker script behavior.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -16,6 +16,7 @@ import {
 
 const PLUGIN_UPDATE_SCENARIO_SCRIPT = "scripts/e2e/lib/plugin-update/unchanged-scenario.sh";
 const CORRUPT_UPDATE_SCENARIO_SCRIPT = "scripts/e2e/lib/plugin-update/corrupt-update-scenario.sh";
+const CORRUPT_UPDATE_DOCKER_SCRIPT = "scripts/e2e/update-corrupt-plugin-docker.sh";
 const PLUGIN_UPDATE_PROBE_SCRIPT = "scripts/e2e/lib/plugin-update/probe.mjs";
 const PLUGIN_UPDATE_REGISTRY_SCRIPT = "scripts/e2e/lib/plugin-update/registry-server.mjs";
 const CORRUPT_PLUGIN_ID = "demo-corrupt-plugin";
@@ -92,6 +93,47 @@ function runProbeFileStatus(
     stdio: "pipe",
   });
   return { status: result.status, stderr: result.stderr };
+}
+
+function runCorruptUpdateDockerBaseline(env: Record<string, string>) {
+  const root = mkdtempSync(path.join(tmpdir(), "openclaw-corrupt-update-docker-"));
+  const binDir = path.join(root, "bin");
+  const dockerArgsPath = path.join(root, "docker-args");
+  const packagePath = path.join(root, "candidate.tgz");
+  try {
+    mkdirSync(binDir);
+    writeFileSync(packagePath, "fake package");
+    writeFileSync(
+      path.join(binDir, "docker"),
+      `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "run" ]]; then
+  printf '%s\n' "$@" > "$DOCKER_ARGS_PATH"
+fi
+`,
+      { mode: 0o755 },
+    );
+    const result = spawnSync("bash", [CORRUPT_UPDATE_DOCKER_SCRIPT], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        DOCKER_ARGS_PATH: dockerArgsPath,
+        OPENCLAW_CURRENT_PACKAGE_TGZ: packagePath,
+        OPENCLAW_SKIP_DOCKER_BUILD: "1",
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        ...env,
+      },
+    });
+    const dockerArgs = existsSync(dockerArgsPath) ? readFileSync(dockerArgsPath, "utf8") : "";
+    return {
+      baseline: dockerArgs
+        .split("\n")
+        .find((entry) => entry.startsWith("OPENCLAW_UPDATE_CORRUPT_PLUGIN_BASELINE=")),
+      result,
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 async function waitForPortFile(portFile: string): Promise<number> {
@@ -308,6 +350,25 @@ describe("plugin update unchanged Docker E2E", () => {
     expect(script).toContain('openclaw_e2e_print_log "$post_core_result_path"');
     expect(script).not.toContain("cat /tmp/openclaw-update-corrupt-");
     expect(script.match(/assert-corrupt-policy-preserved/g)).toHaveLength(3);
+  });
+
+  it("inherits the shared upgrade-survivor baseline for corrupt plugin updates", () => {
+    const result = runCorruptUpdateDockerBaseline({
+      OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC: "openclaw@2026.7.1-2",
+    });
+
+    expect(result.result.status, result.result.stderr).toBe(0);
+    expect(result.baseline).toBe("OPENCLAW_UPDATE_CORRUPT_PLUGIN_BASELINE=openclaw@2026.7.1-2");
+  });
+
+  it("keeps an explicit corrupt-plugin baseline ahead of the shared baseline", () => {
+    const result = runCorruptUpdateDockerBaseline({
+      OPENCLAW_UPDATE_CORRUPT_PLUGIN_BASELINE: "openclaw@2026.6.34",
+      OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC: "openclaw@2026.7.1-2",
+    });
+
+    expect(result.result.status, result.result.stderr).toBe(0);
+    expect(result.baseline).toBe("OPENCLAW_UPDATE_CORRUPT_PLUGIN_BASELINE=openclaw@2026.6.34");
   });
 
   it.each([

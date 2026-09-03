@@ -5280,17 +5280,8 @@ test "$package_manager" = "pnpm@12.1.0"
     ]);
     expect(planStep.run).toContain("FULL_RELEASE_PLAN_INPUTS_JSON");
     expect(planStep.env).toMatchObject({
-      CANDIDATE_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "${{ inputs.target_context_ref != '' }}",
-      CANDIDATE_ALLOW_UNRELEASED_CHANGELOG:
-        "${{ inputs.allow_unreleased_changelog || (inputs.target_context_ref == '' && (inputs.ref == 'main' || inputs.ref == 'refs/heads/main')) }}",
       CANDIDATE_EVIDENCE_JSON: "${{ needs.candidate_acquisition.outputs.binding_json }}",
-      CANDIDATE_RELEASE_SOAK:
-        "${{ inputs.run_release_soak || inputs.release_profile == 'stable' || inputs.release_profile == 'full' }}",
-      CANDIDATE_SHARED_IMAGE_POLICY: "no-push-artifact",
-      CANDIDATE_UPGRADE_SURVIVOR_BASELINE: "openclaw@latest",
-      CANDIDATE_UPGRADE_SURVIVOR_BASELINES: "",
-      CANDIDATE_UPGRADE_SURVIVOR_SCENARIOS:
-        "${{ (inputs.run_release_soak || inputs.release_profile == 'stable' || inputs.release_profile == 'full') && 'reported-issues' || '' }}",
+      CANDIDATE_REQUEST_JSON: "${{ needs.resolve_target.outputs.candidate_request_json }}",
       EVIDENCE_CHANGED_PATHS: "${{ needs.evidence_reuse.outputs.changed_paths || '[]' }}",
       EVIDENCE_RUN_ID: "${{ needs.evidence_reuse.outputs.evidence_run_id }}",
       TRUSTED_WORKFLOW_JSON: "${{ needs.resolve_target.outputs.trusted_workflow_json }}",
@@ -5301,7 +5292,9 @@ test "$package_manager" = "pnpm@12.1.0"
     expect(planStep.run).toContain(
       '--argjson candidateEvidence "${CANDIDATE_EVIDENCE_JSON:-null}"',
     );
-    expect(planStep.run).toContain("candidateRequestInput: {");
+    expect(planStep.run).toContain('--argjson candidateRequestInput "$CANDIDATE_REQUEST_JSON"');
+    expect(planStep.run).toContain("candidateRequestInput: $candidateRequestInput");
+    expect(planStep.run).not.toContain("candidateRequestInput: {");
     expect(planStep.run).toContain('--argjson trustedWorkflow "$TRUSTED_WORKFLOW_JSON"');
     expect(planCache.uses).toBe(ACTIONS_CACHE_V6);
     expect(planCache["continue-on-error"]).toBe(true);
