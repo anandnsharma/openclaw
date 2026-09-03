@@ -1,6 +1,7 @@
 import {
   type AgentPlanStep,
   createChannelProgressDraftCompositor,
+  createChannelProgressWorkCounter,
   createDraftStreamLoop,
   formatChannelProgressDraftText,
   isChannelProgressDraftWorkToolName,
@@ -125,6 +126,7 @@ export function createSlackProgressRuntime(runtimeParams: {
     nativeStreamOrder = run.catch(() => undefined);
     return run;
   };
+  const progressWorkCounter = createChannelProgressWorkCounter();
   const progressSeed = `${account.accountId}:${message.channel}`;
   const slackProgressStyle = resolveSlackProgressStyle(account.config);
   // THIS BEHAVIOR IS INTENTIONAL AND MUST NOT BE CASUALLY ADJUSTED.
@@ -137,6 +139,7 @@ export function createSlackProgressRuntime(runtimeParams: {
     setup: { account, cfg, ctx, prepared, slackClient },
     draftStream,
     enabled: useDraftProgressCard,
+    progressWorkCounter,
     progressSeed,
     explicitTitle: explicitProgressTitle,
     maxLineChars: progressDraftMaxLineChars,
@@ -227,9 +230,10 @@ export function createSlackProgressRuntime(runtimeParams: {
     const reconciled = reconcileSlackNativeTaskChunks({
       previous: nativeStreamSnapshot,
       chunks: buildSlackProgressStreamChunks({
-        title: resolveNativeProgressTitle(snapshot) ?? "Working",
+        title: resolveNativeProgressTitle(snapshot),
         lines: resolveNativeProgressLines(snapshot),
         plan: snapshot.plan,
+        maxLineChars: progressDraftMaxLineChars,
       }),
     });
     const chunks = reconciled.chunks;
@@ -325,12 +329,12 @@ export function createSlackProgressRuntime(runtimeParams: {
   };
 
   const resetProgressTurnState = () => {
+    progressWorkCounter.reset();
     nativeNarrationRenderedText = "";
     nativeNarrationSourceText = "";
   };
 
   const progressDraft = createChannelProgressDraftCompositor({
-    presentation: isProgressMode && slackProgressStyle === "card" ? "summary" : undefined,
     entry: account.config,
     mode: slackStreaming.mode,
     active: progressDraftActive,
@@ -421,6 +425,7 @@ export function createSlackProgressRuntime(runtimeParams: {
       lines.length === 0 &&
       !snapshot.plan?.length &&
       !hasRetirableNativeTasks &&
+      !snapshot.diffStat &&
       !narrationUpdate.delta &&
       !sessionUrl
     ) {
@@ -434,7 +439,9 @@ export function createSlackProgressRuntime(runtimeParams: {
           (lines.length === 0 && !snapshot.plan?.length ? "Working" : undefined),
         lines,
         plan: snapshot.plan,
+        maxLineChars: progressDraftMaxLineChars,
         finalInProgressStatus,
+        diffStat: snapshot.diffStat,
         sessionUrl,
       }),
     }).chunks;
@@ -708,6 +715,7 @@ export function createSlackProgressRuntime(runtimeParams: {
     previewToolProgressEnabled,
     suppressDefaultToolProgressMessages,
     progressDraft,
+    progressWorkCounter,
     commentaryProgressEnabled,
     async cancel() {
       progressDraft.cancel();

@@ -479,6 +479,9 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
           if (statusReactionsEnabled) {
             await statusReactions.setTool(payload.name);
           }
+          if (payload.phase === "start") {
+            progress.progressWorkCounter.noteToolCall(payload.name);
+          }
           return await progress.progressDraft.pushToolEvent(payload);
         },
         onItemEvent: async (payload) => {
