@@ -809,7 +809,9 @@ final class OpenClawSnapshotUITests: XCTestCase {
         // Regression proof for #108692 and #135214: the transcript remains rendered while typing,
         // then the sent turn follows the live edge without a manual redraw or scroll.
         XCTAssertTrue(keyboard.exists)
-        let sentPrompt = app.staticTexts[prompt]
+        let sentPrompt = app.staticTexts.matching(
+            NSPredicate(format: "label == %@", prompt))
+            .firstMatch
         XCTAssertTrue(sentPrompt.waitForExistence(timeout: 8))
         let reply = app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS %@", "keep the mobile workflow connected to the gateway"))
@@ -883,7 +885,7 @@ final class OpenClawSnapshotUITests: XCTestCase {
         let app = try XCTUnwrap(self.app)
 
         let assistant = app.staticTexts[
-            "Ready when you are. I can check a project, coordinate an agent, or prepare the next step."
+            "Ready when you are. I can check a project, coordinate an agent, or prepare the next step.",
         ]
         XCTAssertTrue(assistant.waitForExistence(timeout: 8))
         assistant.press(forDuration: 0.8)
@@ -1346,7 +1348,7 @@ extension OpenClawSnapshotUITests {
         XCTAssertTrue(send.waitForExistence(timeout: 3))
         XCTAssertFalse(send.isEnabled)
         XCTAssertTrue(app.staticTexts[
-            "Authentication failed. Review the provider credential or sign-in, then retry."
+            "Authentication failed. Review the provider credential or sign-in, then retry.",
         ].waitForExistence(timeout: 3))
         self.attachScreenshot(named: "chat-composer-model-auth-failed")
     }
