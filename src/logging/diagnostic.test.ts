@@ -17,6 +17,10 @@ import { emitCoreModelRequestStartedDiagnosticEvent } from "../infra/diagnostic-
 import { emitCoreSemanticRunProgressDiagnosticEvent } from "../infra/diagnostic-semantic-run-progress.js";
 import { DEFAULT_UNDICI_STREAM_TIMEOUT_MS } from "../infra/net/undici-global-dispatcher.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import {
+  clearDiagnosticBackendLivenessDeadline,
+  markDiagnosticBackendLivenessDeadline,
+} from "./diagnostic-backend-liveness.js";
 import { withDiagnosticPhase } from "./diagnostic-phase.js";
 import {
   getDiagnosticSessionActivitySnapshot,
@@ -360,6 +364,7 @@ describe("stuck session diagnostics threshold", () => {
   afterEach(() => {
     resetDiagnosticEventsForTest();
     resetDiagnosticStateForTest();
+    clearDiagnosticBackendLivenessDeadline({ sessionId: "s1", sessionKey: "main" });
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
@@ -1501,13 +1506,10 @@ describe("stuck session diagnostics threshold", () => {
       model: "claude-sonnet-5",
       observationUnit: "turn",
     });
-    markDiagnosticRunProgress({
-      sessionId: "s1",
-      sessionKey: "main",
-      runId: "run-1",
-      reason: "model_call:stream_progress",
-      backendLivenessTimeoutMs: backendDeadlineMs,
-    });
+    markDiagnosticBackendLivenessDeadline(
+      { sessionId: "s1", sessionKey: "main" },
+      backendDeadlineMs,
+    );
 
     // The generic abort threshold (60s here) must not preempt a backend that
     // still allows this silence under its own watchdog.
@@ -1515,6 +1517,31 @@ describe("stuck session diagnostics threshold", () => {
     expect(recoverStuckSession).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(60_000);
+    expectRecoveryCall(
+      recoverStuckSession,
+      { sessionId: "s1", sessionKey: "main", queueDepth: 0, allowActiveAbort: true },
+      ["ageMs", "stateGeneration"],
+    );
+  });
+
+  it("does not recover a quiet CLI backend before its declared allowance expires", () => {
+    const recoverStuckSession = vi.fn();
+    const backendDeadlineMs = 180_000;
+
+    startEnabledDiagnosticHeartbeat({ recoverStuckSession });
+    logSessionStateChange({ sessionId: "s1", sessionKey: "main", state: "processing" });
+    markDiagnosticEmbeddedRunStarted({ sessionId: "s1", sessionKey: "main", runId: "run-1" });
+    // Quiet from the start: the backend declares its allowance at spawn and
+    // never reports progress, which is the window the allowance must cover.
+    markDiagnosticBackendLivenessDeadline(
+      { sessionId: "s1", sessionKey: "main" },
+      backendDeadlineMs,
+    );
+
+    vi.advanceTimersByTime(120_000);
+    expect(recoverStuckSession).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(90_000);
     expectRecoveryCall(
       recoverStuckSession,
       { sessionId: "s1", sessionKey: "main", queueDepth: 0, allowActiveAbort: true },

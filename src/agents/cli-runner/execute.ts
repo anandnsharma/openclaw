@@ -11,6 +11,7 @@ import {
   LOCAL_INSTALLATION_TARGET_UNSUPPORTED,
 } from "../../infra/installation-target-context.js";
 import { compareValidSemver } from "../../infra/semver.js";
+import { clearDiagnosticBackendLivenessDeadline } from "../../logging/diagnostic-backend-liveness.js";
 import { getAgentScopedMediaLocalRoots } from "../../media/local-roots.js";
 import type { CliBackendThinkingLevel } from "../../plugins/cli-backend.types.js";
 import { applySkillEnvOverridesFromSnapshot } from "../../skills/runtime/env-overrides.js";
@@ -595,6 +596,12 @@ export async function executePreparedCliRun(
     } catch (error) {
       recordRunError(error);
     } finally {
+      // The quiet allowance belongs to this child; releasing it here keeps a
+      // settled process from deferring recovery for the next turn.
+      clearDiagnosticBackendLivenessDeadline({
+        ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+        ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+      });
       await toolTracking.finishDeliveryTracking({
         useManagedClaudeLiveSession,
         recordRunError,

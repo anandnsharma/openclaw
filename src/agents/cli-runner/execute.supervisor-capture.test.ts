@@ -19,6 +19,7 @@ import {
   type TrustedToolExecutionEvent,
   waitForDiagnosticEventsDrained,
 } from "../../infra/diagnostic-events.js";
+import { resolveDiagnosticBackendLivenessTimeoutMs } from "../../logging/diagnostic-backend-liveness.js";
 import {
   getDiagnosticSessionActivitySnapshot,
   resetDiagnosticRunActivityForTest,
@@ -284,10 +285,19 @@ describe("executePreparedCliRun supervisor output capture", () => {
     });
   });
 
-  it("publishes the quiet allowance for a non-Claude CLI backend too", async () => {
+  it("publishes the quiet allowance for a non-Claude CLI backend before any output", async () => {
     await withDiagnosticsEnabled(async () => {
+      const context = buildPreparedCliRunContext({ output: "text", provider: "local-cli" });
+      const sessionRef = {
+        sessionId: context.params.sessionId,
+        sessionKey: context.params.sessionKey,
+      };
+      let allowanceBeforeOutput: number | undefined;
       supervisorSpawnMock.mockImplementationOnce(async (...args: unknown[]) => {
         const input = args[0] as SupervisorSpawnInput;
+        // Read before emitting anything: a backend allowed to stay quiet must
+        // already have published its allowance by the time its child starts.
+        allowanceBeforeOutput = resolveDiagnosticBackendLivenessTimeoutMs(sessionRef);
         input.onStdout?.("done");
         return createManagedRun({
           reason: "exit",
@@ -300,17 +310,14 @@ describe("executePreparedCliRun supervisor output capture", () => {
           noOutputTimedOut: false,
         });
       });
-      // The Claude-only model-call diagnostics never arm for this backend, so
-      // the deadline has to reach recovery through the shared stream path.
-      const context = buildPreparedCliRunContext({ output: "text", provider: "local-cli" });
 
       await executePreparedCliRun(context);
 
-      const snapshot = getDiagnosticSessionActivitySnapshot({
-        sessionId: context.params.sessionId,
-        sessionKey: context.params.sessionKey,
-      });
-      expect(snapshot.activeBackendLivenessTimeoutMs).toBeGreaterThan(0);
+      // The Claude-only model-call diagnostics never arm for this backend, so
+      // the allowance has to reach recovery through the shared CLI path.
+      expect(allowanceBeforeOutput).toBeGreaterThan(0);
+      // ...and it must not outlive the child that declared it.
+      expect(resolveDiagnosticBackendLivenessTimeoutMs(sessionRef)).toBeUndefined();
     });
   });
 

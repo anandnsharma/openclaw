@@ -5,6 +5,7 @@ import {
   resolveEventSessionRoutingPolicy,
   scopedHeartbeatWakeOptionsForPolicy,
 } from "../../infra/event-session-routing.js";
+import { markDiagnosticBackendLivenessDeadline } from "../../logging/diagnostic-backend-liveness.js";
 import { createModelCallStreamProgressReporter } from "../../logging/diagnostic-model-stream-progress.js";
 import type { CliBackendConfig } from "../../plugins/cli-backend.types.js";
 import type { RunExit } from "../../process/supervisor/types.js";
@@ -158,8 +159,11 @@ export async function executeCliProcess(params: {
     runId: runParams.runId,
     ...(runParams.sessionKey ? { sessionKey: runParams.sessionKey } : {}),
     ...(runParams.sessionId ? { sessionId: runParams.sessionId } : {}),
-    backendLivenessTimeoutMs: params.noOutputTimeoutMs,
   };
+  // Declared before the child starts, not on its first chunk: a backend allowed
+  // to stay quiet has produced nothing yet, and that is exactly the window the
+  // allowance has to cover. Released when this process settles.
+  markDiagnosticBackendLivenessDeadline(streamProgressTarget, params.noOutputTimeoutMs);
   const consumeStdout = (chunk: string) => {
     const chunkBytes = Buffer.byteLength(chunk);
     params.diagnostics?.observeCliOutput(chunk, "stdout", chunkBytes);

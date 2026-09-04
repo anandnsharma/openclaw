@@ -19,8 +19,6 @@ export type DiagnosticSessionActivitySnapshot = {
   lastProgressReason?: string;
   repeatedRequestNoProgressAgeMs?: number;
   activeModelCallRequestTimeoutMs?: number;
-  /** Liveness deadline the executing backend already enforces for this work. */
-  activeBackendLivenessTimeoutMs?: number;
 };
 
 type SnapshotTool = {
@@ -35,7 +33,6 @@ type SnapshotActivity = DiagnosticArgumentChurnActivity &
     activeModelCalls: ReadonlyMap<string, unknown>;
     activeCoreModelCalls: ReadonlyMap<object, ReadonlyMap<string, { requestTimeoutMs?: number }>>;
     activeTools: ReadonlyMap<string, SnapshotTool>;
-    backendLivenessTimeoutMs?: number;
     lastProgressAt: number;
     lastProgressReason?: string;
   };
@@ -92,7 +89,6 @@ export function buildDiagnosticSessionActivitySnapshot(
       now,
     ),
     activeModelCallRequestTimeoutMs,
-    activeBackendLivenessTimeoutMs: activity.backendLivenessTimeoutMs,
   };
 }
 

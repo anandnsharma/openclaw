@@ -12,6 +12,7 @@ import {
   type DiagnosticLivenessWarningReason,
 } from "../infra/diagnostic-events.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import { resolveDiagnosticBackendLivenessTimeoutMs } from "./diagnostic-backend-liveness.js";
 import { emitDiagnosticMemorySample, resetDiagnosticMemoryForTest } from "./diagnostic-memory.js";
 import {
   getCurrentDiagnosticPhase,
@@ -485,13 +486,14 @@ function isStalledEmbeddedRunRecoveryEligible(params: {
   classification: SessionAttentionClassification | undefined;
   activity?: DiagnosticSessionActivitySnapshot;
   stuckSessionAbortMs: number;
+  backendLivenessTimeoutMs?: number;
 }): boolean {
   const lastProgressAgeMs = params.activity?.lastProgressAgeMs;
   // A backend that declares its own liveness deadline owns recovery timing
   // inside it; the generic floor may only extend that allowance, never shorten it.
   const effectiveAbortMs = Math.max(
     params.stuckSessionAbortMs,
-    params.activity?.activeBackendLivenessTimeoutMs ?? 0,
+    params.backendLivenessTimeoutMs ?? 0,
   );
   return (
     params.classification?.eventType === "session.stalled" &&
@@ -526,12 +528,13 @@ function isStalledModelCallRecoveryEligible(params: {
   classification: SessionAttentionClassification | undefined;
   activity?: DiagnosticSessionActivitySnapshot;
   stuckSessionAbortMs: number;
+  backendLivenessTimeoutMs?: number;
 }): boolean {
   const lastProgressAgeMs = params.activity?.lastProgressAgeMs;
   const effectiveAbortMs = Math.max(
     params.stuckSessionAbortMs,
     params.activity?.activeModelCallRequestTimeoutMs ?? 0,
-    params.activity?.activeBackendLivenessTimeoutMs ?? 0,
+    params.backendLivenessTimeoutMs ?? 0,
   );
   // Local providers are not blanket-exempt from recovery. Streaming model
   // chunks refresh run activity while emitted progress events are throttled, so
@@ -549,11 +552,12 @@ function isActiveAbortRecoveryEligible(params: {
   classification: SessionAttentionClassification | undefined;
   activity?: DiagnosticSessionActivitySnapshot;
   stuckSessionAbortMs: number;
+  backendLivenessTimeoutMs?: number;
 }): boolean {
   const effectiveModelAbortMs = Math.max(
     params.stuckSessionAbortMs,
     params.activity?.activeModelCallRequestTimeoutMs ?? 0,
-    params.activity?.activeBackendLivenessTimeoutMs ?? 0,
+    params.backendLivenessTimeoutMs ?? 0,
   );
   const activeModelCallRequestTimeoutMs = params.activity?.activeModelCallRequestTimeoutMs;
   const activeModelCallAllowanceExpired =
@@ -1003,6 +1007,12 @@ function logSessionAttention(
     classification,
     activity,
     stuckSessionAbortMs: params.abortThresholdMs,
+    // The executing backend owns recovery timing inside the quiet allowance it
+    // already enforces; the generic floor may only extend it, never shorten it.
+    backendLivenessTimeoutMs: resolveDiagnosticBackendLivenessTimeoutMs({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    }),
   });
   const recovery =
     classification.recoveryEligible || allowActiveAbort
