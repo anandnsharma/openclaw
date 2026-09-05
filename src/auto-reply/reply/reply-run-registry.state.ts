@@ -170,12 +170,16 @@ export function getAttachedBackend(operation: ReplyOperation): ReplyBackendHandl
   return attachedBackendByOperation.get(operation);
 }
 
-/**
- * True once a turn commits its terminal outcome and only delivery/finalization
- * remains. A stale watchdog must not treat that as a stall: the reply already
- * exists, so aborting here discards output the backend produced. The
- * finalization lease and terminal-settle timer still bound this owner.
- */
+export function expireStaleReplyOperation(
+  operation: ReplyOperation,
+  reason: ReplyOperationStaleReason,
+  options?: ReplyOperationStaleExpiryOptions,
+): boolean {
+  return expireReplyOperationByOperation.get(operation)?.(reason, options) ?? false;
+}
+
+// Committed output belongs to the bounded finalization owner. Stale recovery
+// must not cancel delivery after the backend has already produced its answer.
 export function hasCommittedReplyOperationOutcome(operation: ReplyOperation): boolean {
   return !operation.result && abortFrozenOperations.has(operation);
 }

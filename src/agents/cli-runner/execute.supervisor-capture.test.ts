@@ -19,9 +19,11 @@ import {
   type TrustedToolExecutionEvent,
   waitForDiagnosticEventsDrained,
 } from "../../infra/diagnostic-events.js";
-import { resolveDiagnosticBackendLivenessTimeoutMs } from "../../logging/diagnostic-backend-liveness.js";
 import {
+  closeDiagnosticEmbeddedRunOwner,
+  createDiagnosticEmbeddedRunOwner,
   getDiagnosticSessionActivitySnapshot,
+  markDiagnosticEmbeddedRunStarted,
   resetDiagnosticRunActivityForTest,
   startDiagnosticRunActivityTracking,
 } from "../../logging/diagnostic-run-activity.js";
@@ -203,6 +205,29 @@ async function withDiagnosticsEnabled<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
+function holdSupervisorRun() {
+  const entered = createDeferred();
+  const release = createDeferred();
+  const exit = {
+    reason: "exit" as const,
+    exitCode: 0,
+    exitSignal: null,
+    durationMs: 50,
+    stdout: "",
+    stderr: "",
+    timedOut: false,
+    noOutputTimedOut: false,
+  };
+  const managedRun = createManagedRun(exit);
+  managedRun.wait.mockImplementation(async () => {
+    entered.resolve();
+    await release.promise;
+    return exit;
+  });
+  supervisorSpawnMock.mockResolvedValueOnce(managedRun);
+  return { entered: entered.promise, release: () => release.resolve() };
+}
+
 describe("executePreparedCliRun supervisor output capture", () => {
   it("binds Claude image prompts to the persisted local transcript turn", async () => {
     const entryId = "persisted-image-turn";
@@ -256,73 +281,110 @@ describe("executePreparedCliRun supervisor output capture", () => {
     expect(prompt).toContain(hashCliImageTurnEntryId(entryId));
   });
 
-  it("publishes streamed stdout as run progress so a live turn is not reclaimed", async () => {
-    await withDiagnosticsEnabled(async () => {
-      supervisorSpawnMock.mockImplementationOnce(async (...args: unknown[]) => {
-        const input = args[0] as SupervisorSpawnInput;
-        input.onStdout?.("streamed");
-        return createManagedRun({
-          reason: "exit",
-          exitCode: 0,
-          exitSignal: null,
-          durationMs: 50,
-          stdout: "",
-          stderr: "",
-          timedOut: false,
-          noOutputTimedOut: false,
-        });
+  it.each(["claude-cli", "fixture-cli"])(
+    "owns the initial quiet allowance and streamed progress only while %s executes",
+    async (provider) => {
+      await withDiagnosticsEnabled(async () => {
+        let now = 1_000_000;
+        const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+        const context = buildPreparedCliRunContext({ output: "text", provider });
+        const owner = createDiagnosticEmbeddedRunOwner(context.params);
+        context.params.diagnosticOwner = owner;
+        markDiagnosticEmbeddedRunStarted({ ...context.params, owner });
+        const held = holdSupervisorRun();
+        const run = executePreparedCliRun(context);
+        try {
+          await held.entered;
+          await waitForDiagnosticEventsDrained();
+          const input = requireSupervisorSpawnInput();
+          const quietMs = input.noOutputTimeoutMs;
+          if (quietMs === undefined) {
+            throw new Error("Expected the CLI child quiet timeout");
+          }
+          expect(getDiagnosticSessionActivitySnapshot(context.params)).toMatchObject({
+            hasActiveEmbeddedRun: true,
+            activeBackendLivenessDeadlineAtMs: now + quietMs,
+            activeModelCallRequestTimeoutMs: undefined,
+          });
+
+          now += 250;
+          input.onStdout?.("first");
+          await waitForDiagnosticEventsDrained();
+          expect(getDiagnosticSessionActivitySnapshot(context.params)).toMatchObject({
+            lastProgressAgeMs: 0,
+            lastProgressReason: "model_call:stream_progress",
+            activeBackendLivenessDeadlineAtMs: now + quietMs,
+          });
+
+          // A second chunk inside the diagnostic event throttle still refreshes liveness.
+          now += 100;
+          input.onStdout?.(" second");
+          await waitForDiagnosticEventsDrained();
+          expect(getDiagnosticSessionActivitySnapshot(context.params)).toMatchObject({
+            lastProgressAgeMs: 0,
+            activeBackendLivenessDeadlineAtMs: now + quietMs,
+          });
+
+          held.release();
+          await expect(run).resolves.toMatchObject({ text: "first second" });
+          await waitForDiagnosticEventsDrained();
+          const closed = getDiagnosticSessionActivitySnapshot(context.params);
+          expect(closed.hasActiveEmbeddedRun).toBe(true);
+          expect(closed.activeBackendLivenessDeadlineAtMs).toBeUndefined();
+        } finally {
+          held.release();
+          await Promise.allSettled([run]);
+          closeDiagnosticEmbeddedRunOwner(owner);
+          clock.mockRestore();
+        }
       });
-      const context = buildPreparedCliRunContext({ output: "text", provider: "claude-cli" });
+    },
+  );
 
-      await executePreparedCliRun(context);
+  it("ignores stdout from a closed owner after a same-id owner replacement", async () => {
+    await withDiagnosticsEnabled(async () => {
+      let now = 1_000_000;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      const firstContext = buildPreparedCliRunContext({ output: "text", provider: "fixture-cli" });
+      const firstOwner = createDiagnosticEmbeddedRunOwner(firstContext.params);
+      firstContext.params.diagnosticOwner = firstOwner;
+      markDiagnosticEmbeddedRunStarted({ ...firstContext.params, owner: firstOwner });
+      const firstHeld = holdSupervisorRun();
+      const firstRun = executePreparedCliRun(firstContext);
+      const successorOwner = createDiagnosticEmbeddedRunOwner(firstContext.params);
+      try {
+        await firstHeld.entered;
+        const oldInput = requireSupervisorSpawnInput();
+        oldInput.onStdout?.("first");
+        await waitForDiagnosticEventsDrained();
+        closeDiagnosticEmbeddedRunOwner(firstOwner);
+        markDiagnosticEmbeddedRunStarted({ ...firstContext.params, owner: successorOwner });
 
-      expect(
-        getDiagnosticSessionActivitySnapshot({
-          sessionId: context.params.sessionId,
-          sessionKey: context.params.sessionKey,
-        }),
-      ).toMatchObject({ lastProgressReason: "model_call:stream_progress" });
+        now += 100;
+        const before = getDiagnosticSessionActivitySnapshot(firstContext.params);
+        expect(before.activeBackendLivenessDeadlineAtMs).toBeUndefined();
+        oldInput.onStdout?.(" late old output");
+        await waitForDiagnosticEventsDrained();
+        expect(getDiagnosticSessionActivitySnapshot(firstContext.params)).toEqual(before);
+
+        firstHeld.release();
+        await firstRun;
+        await waitForDiagnosticEventsDrained();
+        expect(getDiagnosticSessionActivitySnapshot(firstContext.params)).toEqual(before);
+      } finally {
+        firstHeld.release();
+        await Promise.allSettled([firstRun]);
+        closeDiagnosticEmbeddedRunOwner(firstOwner);
+        closeDiagnosticEmbeddedRunOwner(successorOwner);
+        clock.mockRestore();
+      }
     });
   });
 
-  it("publishes the quiet allowance for a non-Claude CLI backend before any output", async () => {
+  it("refreshes the backend quiet deadline without refreshing an active tool's progress", async () => {
     await withDiagnosticsEnabled(async () => {
-      const context = buildPreparedCliRunContext({ output: "text", provider: "local-cli" });
-      const sessionRef = {
-        sessionId: context.params.sessionId,
-        sessionKey: context.params.sessionKey,
-      };
-      let allowanceBeforeOutput: number | undefined;
-      supervisorSpawnMock.mockImplementationOnce(async (...args: unknown[]) => {
-        const input = args[0] as SupervisorSpawnInput;
-        // Read before emitting anything: a backend allowed to stay quiet must
-        // already have published its allowance by the time its child starts.
-        allowanceBeforeOutput = resolveDiagnosticBackendLivenessTimeoutMs(sessionRef);
-        input.onStdout?.("done");
-        return createManagedRun({
-          reason: "exit",
-          exitCode: 0,
-          exitSignal: null,
-          durationMs: 50,
-          stdout: "",
-          stderr: "",
-          timedOut: false,
-          noOutputTimedOut: false,
-        });
-      });
-
-      await executePreparedCliRun(context);
-
-      // The Claude-only model-call diagnostics never arm for this backend, so
-      // the allowance has to reach recovery through the shared CLI path.
-      expect(allowanceBeforeOutput).toBeGreaterThan(0);
-      // ...and it must not outlive the child that declared it.
-      expect(resolveDiagnosticBackendLivenessTimeoutMs(sessionRef)).toBeUndefined();
-    });
-  });
-
-  it("does not refresh the progress clock from stdout while a parsed tool owns the turn", async () => {
-    await withDiagnosticsEnabled(async () => {
+      let now = 1_000_000;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
       const toolUse = `${JSON.stringify({
         type: "assistant",
         message: {
@@ -336,37 +398,38 @@ describe("executePreparedCliRun supervisor output capture", () => {
         result: "final answer",
       })}\n`;
       const context = buildPreparedCliRunContext({ output: "jsonl", provider: "claude-cli" });
-      const sessionRef = {
-        sessionId: context.params.sessionId,
-        sessionKey: context.params.sessionKey,
-      };
-      let progressReasonWhileToolOpen: string | undefined;
-      supervisorSpawnMock.mockImplementationOnce(async (...args: unknown[]) => {
-        const input = args[0] as SupervisorSpawnInput;
+      const owner = createDiagnosticEmbeddedRunOwner(context.params);
+      context.params.diagnosticOwner = owner;
+      markDiagnosticEmbeddedRunStarted({ ...context.params, owner });
+      const held = holdSupervisorRun();
+      const run = executePreparedCliRun(context);
+      try {
+        await held.entered;
+        const input = requireSupervisorSpawnInput();
+        const quietMs = input.noOutputTimeoutMs;
+        if (quietMs === undefined) {
+          throw new Error("Expected the CLI child quiet timeout");
+        }
         input.onStdout?.(toolUse);
-        // Let the tool-start event land so the clock reads tool:Bash:started.
         await waitForDiagnosticEventsDrained();
-        // Chatter emitted while the tool is still open must not look like progress,
-        // or a wedged tool never ages into blocked-tool recovery.
-        input.onStdout?.("noise");
-        progressReasonWhileToolOpen =
-          getDiagnosticSessionActivitySnapshot(sessionRef).lastProgressReason;
-        input.onStdout?.(resultEvent);
-        return createManagedRun({
-          reason: "exit",
-          exitCode: 0,
-          exitSignal: null,
-          durationMs: 50,
-          stdout: "",
-          stderr: "",
-          timedOut: false,
-          noOutputTimedOut: false,
+        now += 250;
+        input.onStdout?.("noise\n");
+        await waitForDiagnosticEventsDrained();
+        expect(getDiagnosticSessionActivitySnapshot(context.params)).toMatchObject({
+          activeWorkKind: "tool_call",
+          lastProgressReason: "tool:Bash:started",
+          lastProgressAgeMs: 250,
+          activeBackendLivenessDeadlineAtMs: now + quietMs,
         });
-      });
-
-      await executePreparedCliRun(context);
-
-      expect(progressReasonWhileToolOpen).toBe("tool:Bash:started");
+        input.onStdout?.(resultEvent);
+        held.release();
+        await expect(run).resolves.toMatchObject({ text: "final answer" });
+      } finally {
+        held.release();
+        await Promise.allSettled([run]);
+        closeDiagnosticEmbeddedRunOwner(owner);
+        clock.mockRestore();
+      }
     });
   });
 

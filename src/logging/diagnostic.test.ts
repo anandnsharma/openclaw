@@ -17,12 +17,10 @@ import { emitCoreModelRequestStartedDiagnosticEvent } from "../infra/diagnostic-
 import { emitCoreSemanticRunProgressDiagnosticEvent } from "../infra/diagnostic-semantic-run-progress.js";
 import { DEFAULT_UNDICI_STREAM_TIMEOUT_MS } from "../infra/net/undici-global-dispatcher.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import {
-  clearDiagnosticBackendLivenessDeadline,
-  markDiagnosticBackendLivenessDeadline,
-} from "./diagnostic-backend-liveness.js";
 import { withDiagnosticPhase } from "./diagnostic-phase.js";
 import {
+  beginDiagnosticBackendActivity,
+  closeDiagnosticEmbeddedRunOwner,
   getDiagnosticSessionActivitySnapshot,
   createDiagnosticEmbeddedRunOwner,
   markDiagnosticEmbeddedRunEnded,
@@ -364,7 +362,6 @@ describe("stuck session diagnostics threshold", () => {
   afterEach(() => {
     resetDiagnosticEventsForTest();
     resetDiagnosticStateForTest();
-    clearDiagnosticBackendLivenessDeadline({ sessionId: "s1", sessionKey: "main" });
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
@@ -1072,36 +1069,21 @@ describe("stuck session diagnostics threshold", () => {
     );
   });
 
-  it("recovers repeated request attempts despite fresh mechanical activity", async () => {
-    const events: DiagnosticEventPayload[] = [];
-    const recoverStuckSession = vi.fn(() => new Promise<never>(() => {}));
-    const stuckSessionWarnMs = 30_000;
-    const stuckSessionAbortMs = 90_000;
-    const unsubscribe = onDiagnosticEvent((event) => events.push(event));
-    try {
-      startEnabledDiagnosticHeartbeat({
-        recoverStuckSession,
-        testTimings: { stuckSessionWarnMs, stuckSessionAbortMs },
-      });
-      logSessionStateChange({ sessionId: "s1", sessionKey: "main", state: "processing" });
-      markDiagnosticEmbeddedRunStarted({ sessionId: "s1", sessionKey: "main", runId: "run-1" });
-      markDiagnosticModelStartedForTest({
-        sessionId: "s1",
-        sessionKey: "main",
-        runId: "run-1",
-        provider: "mock",
-        model: "retrying-model",
-        observationUnit: "request",
-      });
-
-      for (let attempt = 2; attempt <= 6; attempt += 1) {
-        vi.advanceTimersByTime(30_000);
-        logSessionStateChange({
-          sessionId: "s1",
-          sessionKey: "main",
-          state: "processing",
-          reason: "run_started",
+  it.each(["model_call", "tool_call"] as const)(
+    "recovers repeated request attempts during %s despite fresh mechanical activity",
+    async (activeWorkKind) => {
+      const events: DiagnosticEventPayload[] = [];
+      const recoverStuckSession = vi.fn(() => new Promise<never>(() => {}));
+      const stuckSessionWarnMs = 30_000;
+      const stuckSessionAbortMs = 90_000;
+      const unsubscribe = onDiagnosticEvent((event) => events.push(event));
+      try {
+        startEnabledDiagnosticHeartbeat({
+          recoverStuckSession,
+          testTimings: { stuckSessionWarnMs, stuckSessionAbortMs },
         });
+        logSessionStateChange({ sessionId: "s1", sessionKey: "main", state: "processing" });
+        markDiagnosticEmbeddedRunStarted({ sessionId: "s1", sessionKey: "main", runId: "run-1" });
         markDiagnosticModelStartedForTest({
           sessionId: "s1",
           sessionKey: "main",
@@ -1110,29 +1092,59 @@ describe("stuck session diagnostics threshold", () => {
           model: "retrying-model",
           observationUnit: "request",
         });
-      }
-    } finally {
-      unsubscribe();
-    }
+        if (activeWorkKind === "tool_call") {
+          // An open tool must not hide mature repeated-request evidence.
+          markDiagnosticToolStartedForTest({
+            sessionId: "s1",
+            sessionKey: "main",
+            runId: "run-1",
+            toolName: "read",
+            toolCallId: "read-during-retries",
+          });
+        }
 
-    expectRecordFields(
-      requireRecord(
-        events.find((event) => event.type === "session.stalled"),
-        "stalled event",
-      ),
-      {
-        classification: "stalled_agent_run",
-        reason: "repeated_model_requests_without_progress",
-        repeatedRequestNoProgressAgeMs: stuckSessionAbortMs,
-      },
-    );
-    expect(recoverStuckSession).toHaveBeenCalledTimes(1);
-    expectRecoveryCall(
-      recoverStuckSession,
-      { sessionId: "s1", sessionKey: "main", queueDepth: 0, allowActiveAbort: true },
-      ["ageMs", "stateGeneration"],
-    );
-  });
+        for (let attempt = 2; attempt <= 6; attempt += 1) {
+          vi.advanceTimersByTime(30_000);
+          logSessionStateChange({
+            sessionId: "s1",
+            sessionKey: "main",
+            state: "processing",
+            reason: "run_started",
+          });
+          markDiagnosticModelStartedForTest({
+            sessionId: "s1",
+            sessionKey: "main",
+            runId: "run-1",
+            provider: "mock",
+            model: "retrying-model",
+            observationUnit: "request",
+          });
+        }
+      } finally {
+        unsubscribe();
+      }
+
+      expectRecordFields(
+        requireRecord(
+          events.find((event) => event.type === "session.stalled"),
+          "stalled event",
+        ),
+        {
+          classification: "stalled_agent_run",
+          reason: "repeated_model_requests_without_progress",
+          repeatedRequestNoProgressAgeMs: stuckSessionAbortMs,
+          activeWorkKind,
+          activeToolAgeMs: activeWorkKind === "tool_call" ? stuckSessionAbortMs : undefined,
+        },
+      );
+      expect(recoverStuckSession).toHaveBeenCalledTimes(1);
+      expectRecoveryCall(
+        recoverStuckSession,
+        { sessionId: "s1", sessionKey: "main", queueDepth: 0, allowActiveAbort: true },
+        ["ageMs", "stateGeneration"],
+      );
+    },
+  );
 
   it("does not recover repeated requests after semantic output resets the clock", async () => {
     const events: DiagnosticEventPayload[] = [];
@@ -1492,61 +1504,33 @@ describe("stuck session diagnostics threshold", () => {
     );
   });
 
-  it("defers stale model call recovery to a longer backend-declared deadline", () => {
+  it("defers a quiet backend until its owned silence deadline expires", () => {
     const recoverStuckSession = vi.fn();
-    const backendDeadlineMs = 180_000;
-
+    const ref = { sessionId: "backend-deadline", sessionKey: "agent:main:backend-deadline" };
+    const runId = "backend-deadline-run";
+    const owner = createDiagnosticEmbeddedRunOwner({ ...ref, runId });
     startEnabledDiagnosticHeartbeat({ recoverStuckSession });
-    logSessionStateChange({ sessionId: "s1", sessionKey: "main", state: "processing" });
-    markDiagnosticModelStartedForTest({
-      sessionId: "s1",
-      sessionKey: "main",
-      runId: "run-1",
-      provider: "anthropic",
-      model: "claude-sonnet-5",
-      observationUnit: "turn",
+    logSessionStateChange({ ...ref, state: "processing" });
+    markDiagnosticEmbeddedRunStarted({ ...ref, runId, owner });
+    const backend = beginDiagnosticBackendActivity({
+      owner,
+      noOutputTimeoutMs: 180_000,
+      assertCurrent: () => {},
     });
-    markDiagnosticBackendLivenessDeadline(
-      { sessionId: "s1", sessionKey: "main" },
-      backendDeadlineMs,
-    );
+    try {
+      // No output has arrived: initial silence still belongs to the backend's deadline.
+      vi.advanceTimersByTime(120_000);
+      expect(recoverStuckSession).not.toHaveBeenCalled();
 
-    // The generic abort threshold (60s here) must not preempt a backend that
-    // still allows this silence under its own watchdog.
-    vi.advanceTimersByTime(120_000);
-    expect(recoverStuckSession).not.toHaveBeenCalled();
-
-    vi.advanceTimersByTime(60_000);
-    expectRecoveryCall(
-      recoverStuckSession,
-      { sessionId: "s1", sessionKey: "main", queueDepth: 0, allowActiveAbort: true },
-      ["ageMs", "stateGeneration"],
-    );
-  });
-
-  it("does not recover a quiet CLI backend before its declared allowance expires", () => {
-    const recoverStuckSession = vi.fn();
-    const backendDeadlineMs = 180_000;
-
-    startEnabledDiagnosticHeartbeat({ recoverStuckSession });
-    logSessionStateChange({ sessionId: "s1", sessionKey: "main", state: "processing" });
-    markDiagnosticEmbeddedRunStarted({ sessionId: "s1", sessionKey: "main", runId: "run-1" });
-    // Quiet from the start: the backend declares its allowance at spawn and
-    // never reports progress, which is the window the allowance must cover.
-    markDiagnosticBackendLivenessDeadline(
-      { sessionId: "s1", sessionKey: "main" },
-      backendDeadlineMs,
-    );
-
-    vi.advanceTimersByTime(120_000);
-    expect(recoverStuckSession).not.toHaveBeenCalled();
-
-    vi.advanceTimersByTime(90_000);
-    expectRecoveryCall(
-      recoverStuckSession,
-      { sessionId: "s1", sessionKey: "main", queueDepth: 0, allowActiveAbort: true },
-      ["ageMs", "stateGeneration"],
-    );
+      vi.advanceTimersByTime(60_000);
+      expectRecoveryCall(recoverStuckSession, { ...ref, queueDepth: 0, allowActiveAbort: true }, [
+        "ageMs",
+        "stateGeneration",
+      ]);
+    } finally {
+      backend.close();
+      closeDiagnosticEmbeddedRunOwner(owner);
+    }
   });
 
   it("does not recover a recent native tool call just because the session is old", async () => {

@@ -1,4 +1,3 @@
-/** Shared stream-liveness progress reporting for streaming model backends. */
 import {
   areDiagnosticsEnabledForProcess,
   emitTrustedDiagnosticEvent,
@@ -16,20 +15,16 @@ export type ModelCallStreamProgressTarget = {
   sessionId?: string;
 };
 
-/**
- * Streaming providers, local or remote, are expected to produce chunks or
- * heartbeat-style progress. Every observed chunk refreshes the in-memory
- * freshness clock the stuck-session watchdog reads, or a turn that is still
- * producing output ages into `active_work_without_progress` and gets aborted
- * mid-flight; diagnostic events stay throttled so token streams do not spam
- * observers. Silent backends refresh nothing and remain recoverable after the
- * stuck-session timeout.
- */
-export function createModelCallStreamProgressReporter(): (
-  target: ModelCallStreamProgressTarget,
-) => void {
+// Refresh recovery on every chunk, but throttle public events. Owner-bound
+// callbacks also reject late output without refreshing a replacement's clock.
+export function createModelCallStreamProgressReporter(
+  recordProgress?: () => boolean,
+): (target: ModelCallStreamProgressTarget) => void {
   let lastEmittedAtMs: number | undefined;
   return (target) => {
+    if (recordProgress && !recordProgress()) {
+      return;
+    }
     if (!areDiagnosticsEnabledForProcess()) {
       return;
     }
@@ -39,7 +34,9 @@ export function createModelCallStreamProgressReporter(): (
       ...(target.sessionId ? { sessionId: target.sessionId } : {}),
       reason: MODEL_CALL_STREAM_PROGRESS_REASON,
     };
-    markDiagnosticRunProgress(fields);
+    if (!recordProgress) {
+      markDiagnosticRunProgress(fields);
+    }
     const now = Date.now();
     if (
       lastEmittedAtMs !== undefined &&

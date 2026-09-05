@@ -1256,6 +1256,13 @@ export async function abortAndDrainEmbeddedAgentRun(params: {
     ? ACTIVE_EMBEDDED_RUN_REGISTRATIONS.get(embeddedRunHandle)?.agentId
     : undefined;
   const replyOperation = resolveActiveReplyOperationForSessionId(params.sessionId);
+  if (
+    params.reason === "stuck_recovery" &&
+    replyOperation &&
+    hasCommittedReplyOperationOutcome(replyOperation)
+  ) {
+    return { aborted: false, drained: false, forceCleared: false };
+  }
   let releaseStaleExpiryBarrier: (() => void) | undefined;
   const staleExpiryBarrier =
     params.reason === "stuck_recovery"

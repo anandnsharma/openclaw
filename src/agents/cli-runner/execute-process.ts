@@ -5,8 +5,8 @@ import {
   resolveEventSessionRoutingPolicy,
   scopedHeartbeatWakeOptionsForPolicy,
 } from "../../infra/event-session-routing.js";
-import { markDiagnosticBackendLivenessDeadline } from "../../logging/diagnostic-backend-liveness.js";
 import { createModelCallStreamProgressReporter } from "../../logging/diagnostic-model-stream-progress.js";
+import { beginDiagnosticBackendActivity } from "../../logging/diagnostic-run-activity.js";
 import type { CliBackendConfig } from "../../plugins/cli-backend.types.js";
 import type { RunExit } from "../../process/supervisor/types.js";
 import type { CliOutput, CliTerminalInterruption } from "../cli-output-contracts.js";
@@ -146,29 +146,27 @@ export async function executeCliProcess(params: {
   let stderrBytes = 0;
   const stderrHash = crypto.createHash("sha256");
   let stderrParseExceeded = false;
-  // Stdout bytes are this backend's liveness proof: the same signal its own
-  // no-output watchdog trusts. Publishing them as run progress keeps the
-  // stuck-session watchdog from reclaiming a turn that is still streaming.
-  // Skipped while a parsed tool owns the turn: that window belongs to
-  // blocked-tool recovery, which reads the same clock and must still expire.
-  const reportStreamProgress = createModelCallStreamProgressReporter();
-  // Every CLI backend already enforces this quiet allowance on its own child.
-  // Publishing it keeps generic stuck-session recovery from reclaiming work
-  // inside an allowance the operator configured on that backend.
+  // Only the core lifecycle owner may publish recovery facts. Plugin records
+  // carry output, never the authority or deadline used to protect its execution.
+  const reportStreamProgress = createModelCallStreamProgressReporter(
+    () => backendActivity?.observeOutput(true) ?? false,
+  );
   const streamProgressTarget = {
     runId: runParams.runId,
     ...(runParams.sessionKey ? { sessionKey: runParams.sessionKey } : {}),
     ...(runParams.sessionId ? { sessionId: runParams.sessionId } : {}),
   };
-  // Declared before the child starts, not on its first chunk: a backend allowed
-  // to stay quiet has produced nothing yet, and that is exactly the window the
-  // allowance has to cover. Released when this process settles.
-  markDiagnosticBackendLivenessDeadline(streamProgressTarget, params.noOutputTimeoutMs);
   const consumeStdout = (chunk: string) => {
     const chunkBytes = Buffer.byteLength(chunk);
     params.diagnostics?.observeCliOutput(chunk, "stdout", chunkBytes);
-    if (params.events.activeParsedToolCount() === 0) {
-      reportStreamProgress(streamProgressTarget);
+    if (chunkBytes > 0) {
+      if (params.events.activeParsedToolCount() === 0) {
+        reportStreamProgress(streamProgressTarget);
+      } else {
+        // Tool chatter renews the transport's quiet allowance, not the separate
+        // blocked-tool progress clock.
+        backendActivity?.observeOutput(false);
+      }
     }
     stdoutBytes += chunkBytes;
     stdoutHash.update(chunk);
@@ -207,132 +205,143 @@ export async function executeCliProcess(params: {
   runParams.assertCurrent?.();
   params.diagnostics?.observeRequestPayload(params.stdin ?? params.argsPrompt ?? "");
   params.assertCurrent();
-  if (params.nodePlacement) {
-    const nodeRun = await executeNodeClaudeRun({
-      context,
-      nodePlacement: params.nodePlacement,
-      executionArgs: params.executionArgs,
-      stdinPayload: params.stdin ?? "",
-      ...(params.nodeSystemPrompt !== undefined
-        ? { nodeSystemPrompt: params.nodeSystemPrompt }
-        : {}),
-      ...(params.nodeEnv ? { nodeEnv: params.nodeEnv } : {}),
-      ...(params.nodeClearEnv ? { nodeClearEnv: params.nodeClearEnv } : {}),
-      noOutputTimeoutMs: params.noOutputTimeoutMs,
-      consumeStdout,
-      consumeStderr,
-      deps: params.deps,
-    });
-    result = nodeRun.result;
-    nodeRunAbortSignal = nodeRun.nodeRunAbortSignal;
-    nodeRunTruncated = nodeRun.nodeRunTruncated;
-  } else if (context.executionTarget.kind === "plugin") {
-    result = await executePluginOwnedProcess({
-      context,
-      execute: context.executionTarget.execute,
-      executionCommand: params.executionCommand,
-      executionArgs: params.executionArgs,
-      env: params.env,
-      prompt: params.prompt,
-      ...(params.promptContext ? { promptContext: params.promptContext } : {}),
-      useResume: params.useResume,
-      forceNewSession:
-        params.cliSessionIdToUse === undefined && context.openClawHistoryPrompt !== undefined,
-      sessionId: params.resolvedSessionId,
-      noOutputTimeoutMs: params.noOutputTimeoutMs,
-      consumeStdout,
-      activeToolCount: params.events.activeParsedToolCount,
-      onNoOutputTimeout: (error) => {
-        pluginTimeout.error = error;
-      },
-      onInterrupted: (reason) => {
-        streamingParser?.finish();
-        const partialOutput = streamingParser?.getOutput();
-        if (
-          !partialOutput?.text.trim() ||
-          partialOutput.errorText ||
-          partialOutput.terminalFailure
-        ) {
-          return false;
-        }
-        terminalInterruption = { reason };
-        return true;
-      },
-      ...(params.useManagedClaudeLiveSession
-        ? {
-            liveSession: {
-              captureKey: params.initialGatewayCaptureKey,
-              beginCapture: params.toolTracking.beginGatewayCapture,
-              requiredGeneration: params.cliSessionIdToUse
-                ? context.requiredClaudeLiveSessionGeneration
-                : undefined,
-            },
-          }
-        : {}),
-    }).catch((error: unknown) => {
-      runParams.assertCurrent?.();
-      if (runParams.abortSignal?.aborted || params.events.hasObservedCliActivity()) {
-        throw error;
-      }
-      throw resolveCliResumeAtError(error, resumeAtArg, failoverContext) ?? error;
-    });
-  } else {
-    const supervisor = params.deps.getProcessSupervisor();
-    const scopeKey = buildCliSupervisorScopeKey({
-      backend: params.backend,
-      backendId: context.backendResolved.id,
-      cliSessionId: params.useResume ? params.resolvedSessionId : undefined,
-    });
-    if (runParams.abortSignal?.aborted) {
-      throw createCliAbortError();
-    }
-    // Startup can wait behind another scoped run. Reserve cancellation under
-    // the caller's run id before awaiting the child or replacement fence.
-    const abortManagedRun = () => supervisor.cancel(runParams.runId, "manual-cancel");
-    runParams.abortSignal?.addEventListener("abort", abortManagedRun, { once: true });
-    try {
-      const managedRun = await supervisor.spawn({
-        assertCurrent: params.assertCurrent,
-        runId: runParams.runId,
-        sessionId: runParams.sessionId,
-        backendId: context.backendResolved.id,
-        scopeKey,
-        replaceExistingScope: Boolean(params.useResume && scopeKey),
-        mode: "child",
-        argv: [params.executionCommand, ...params.executionLeadingArgv, ...params.executionArgs],
-        argv0: params.executionArgv0,
-        timeoutMs: runParams.timeoutMs,
+  const backendActivity = runParams.diagnosticOwner
+    ? beginDiagnosticBackendActivity({
+        owner: runParams.diagnosticOwner,
         noOutputTimeoutMs: params.noOutputTimeoutMs,
-        cwd: context.cwd ?? context.workspaceDir,
-        env: params.env,
-        input: params.stdin ?? "",
-        secretInput: context.preparedBackend.secretInput,
-        captureOutput: false,
-        onStdout: consumeStdout,
-        onStderr: consumeStderr,
+        assertCurrent: params.assertCurrent,
+      })
+    : undefined;
+  try {
+    if (params.nodePlacement) {
+      const nodeRun = await executeNodeClaudeRun({
+        context,
+        nodePlacement: params.nodePlacement,
+        executionArgs: params.executionArgs,
+        stdinPayload: params.stdin ?? "",
+        ...(params.nodeSystemPrompt !== undefined
+          ? { nodeSystemPrompt: params.nodeSystemPrompt }
+          : {}),
+        ...(params.nodeEnv ? { nodeEnv: params.nodeEnv } : {}),
+        ...(params.nodeClearEnv ? { nodeClearEnv: params.nodeClearEnv } : {}),
+        noOutputTimeoutMs: params.noOutputTimeoutMs,
+        consumeStdout,
+        consumeStderr,
+        deps: params.deps,
       });
-      managedRunPid = managedRun.pid;
-      const replyBackendHandle = runParams.replyOperation
-        ? {
-            kind: "cli" as const,
-            runId: runParams.runId,
-            toolAuthorityFingerprint: runParams.toolAuthorityFingerprint,
-            cancel: () => managedRun.cancel("manual-cancel"),
+      result = nodeRun.result;
+      nodeRunAbortSignal = nodeRun.nodeRunAbortSignal;
+      nodeRunTruncated = nodeRun.nodeRunTruncated;
+    } else if (context.executionTarget.kind === "plugin") {
+      result = await executePluginOwnedProcess({
+        context,
+        execute: context.executionTarget.execute,
+        executionCommand: params.executionCommand,
+        executionArgs: params.executionArgs,
+        env: params.env,
+        prompt: params.prompt,
+        ...(params.promptContext ? { promptContext: params.promptContext } : {}),
+        useResume: params.useResume,
+        forceNewSession:
+          params.cliSessionIdToUse === undefined && context.openClawHistoryPrompt !== undefined,
+        sessionId: params.resolvedSessionId,
+        noOutputTimeoutMs: params.noOutputTimeoutMs,
+        consumeStdout,
+        activeToolCount: params.events.activeParsedToolCount,
+        onNoOutputTimeout: (error) => {
+          pluginTimeout.error = error;
+        },
+        onInterrupted: (reason) => {
+          streamingParser?.finish();
+          const partialOutput = streamingParser?.getOutput();
+          if (
+            !partialOutput?.text.trim() ||
+            partialOutput.errorText ||
+            partialOutput.terminalFailure
+          ) {
+            return false;
           }
-        : undefined;
-      if (replyBackendHandle) {
-        runParams.replyOperation?.attachBackend(replyBackendHandle);
-      }
-      try {
-        result = await managedRun.wait();
-      } finally {
-        if (replyBackendHandle) {
-          runParams.replyOperation?.detachBackend(replyBackendHandle);
+          terminalInterruption = { reason };
+          return true;
+        },
+        ...(params.useManagedClaudeLiveSession
+          ? {
+              liveSession: {
+                captureKey: params.initialGatewayCaptureKey,
+                beginCapture: params.toolTracking.beginGatewayCapture,
+                requiredGeneration: params.cliSessionIdToUse
+                  ? context.requiredClaudeLiveSessionGeneration
+                  : undefined,
+              },
+            }
+          : {}),
+      }).catch((error: unknown) => {
+        runParams.assertCurrent?.();
+        if (runParams.abortSignal?.aborted || params.events.hasObservedCliActivity()) {
+          throw error;
         }
+        throw resolveCliResumeAtError(error, resumeAtArg, failoverContext) ?? error;
+      });
+    } else {
+      const supervisor = params.deps.getProcessSupervisor();
+      const scopeKey = buildCliSupervisorScopeKey({
+        backend: params.backend,
+        backendId: context.backendResolved.id,
+        cliSessionId: params.useResume ? params.resolvedSessionId : undefined,
+      });
+      if (runParams.abortSignal?.aborted) {
+        throw createCliAbortError();
       }
-    } finally {
-      runParams.abortSignal?.removeEventListener("abort", abortManagedRun);
+      // Startup can wait behind another scoped run. Reserve cancellation under
+      // the caller's run id before awaiting the child or replacement fence.
+      const abortManagedRun = () => supervisor.cancel(runParams.runId, "manual-cancel");
+      runParams.abortSignal?.addEventListener("abort", abortManagedRun, { once: true });
+      try {
+        const managedRun = await supervisor.spawn({
+          assertCurrent: params.assertCurrent,
+          runId: runParams.runId,
+          sessionId: runParams.sessionId,
+          backendId: context.backendResolved.id,
+          scopeKey,
+          replaceExistingScope: Boolean(params.useResume && scopeKey),
+          mode: "child",
+          argv: [params.executionCommand, ...params.executionLeadingArgv, ...params.executionArgs],
+          argv0: params.executionArgv0,
+          timeoutMs: runParams.timeoutMs,
+          noOutputTimeoutMs: params.noOutputTimeoutMs,
+          cwd: context.cwd ?? context.workspaceDir,
+          env: params.env,
+          input: params.stdin ?? "",
+          secretInput: context.preparedBackend.secretInput,
+          captureOutput: false,
+          onStdout: consumeStdout,
+          onStderr: consumeStderr,
+        });
+        managedRunPid = managedRun.pid;
+        const replyBackendHandle = runParams.replyOperation
+          ? {
+              kind: "cli" as const,
+              runId: runParams.runId,
+              toolAuthorityFingerprint: runParams.toolAuthorityFingerprint,
+              cancel: () => managedRun.cancel("manual-cancel"),
+            }
+          : undefined;
+        if (replyBackendHandle) {
+          runParams.replyOperation?.attachBackend(replyBackendHandle);
+        }
+        try {
+          result = await managedRun.wait();
+        } finally {
+          if (replyBackendHandle) {
+            runParams.replyOperation?.detachBackend(replyBackendHandle);
+          }
+        }
+      } finally {
+        runParams.abortSignal?.removeEventListener("abort", abortManagedRun);
+      }
     }
+  } finally {
+    backendActivity?.close();
   }
   if (
     (runParams.abortSignal?.aborted || nodeRunAbortSignal?.aborted) &&
