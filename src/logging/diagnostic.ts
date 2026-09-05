@@ -53,6 +53,7 @@ import type {
 } from "./diagnostic-session-recovery.js";
 import {
   diagnosticSessionStates,
+  retireDiagnosticSessionObservations,
   getDiagnosticSessionState,
   isDiagnosticSessionStateCurrent,
   pruneDiagnosticSessionStates,
@@ -1292,6 +1293,7 @@ export function stopDiagnosticHeartbeat() {
   }
   lastDiagnosticHeartbeatTickAt = undefined;
   stopDiagnosticRunActivityTracking();
+  retireDiagnosticSessionObservations();
   stopDiagnosticLivenessSampler();
   stopDiagnosticStabilityRecorder();
   uninstallDiagnosticStabilityFatalHook();
