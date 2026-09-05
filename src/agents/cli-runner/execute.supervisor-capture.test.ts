@@ -160,8 +160,8 @@ function buildPreparedCliRunContext(params: {
   };
 }
 
-function requireSupervisorSpawnInput(): SupervisorSpawnInput {
-  const call = supervisorSpawnMock.mock.calls[0];
+function requireSupervisorSpawnInput(index = 0): SupervisorSpawnInput {
+  const call = supervisorSpawnMock.mock.calls[index];
   if (!call) {
     throw new Error("Expected supervisor spawn");
   }
@@ -377,6 +377,74 @@ describe("executePreparedCliRun supervisor output capture", () => {
         await Promise.allSettled([firstRun]);
         closeDiagnosticEmbeddedRunOwner(firstOwner);
         closeDiagnosticEmbeddedRunOwner(successorOwner);
+        clock.mockRestore();
+      }
+    });
+  });
+
+  it("retains the newer same-session allowance when an overlapping serialize:false call settles", async () => {
+    await withDiagnosticsEnabled(async () => {
+      let now = 1_000_000;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      const first = buildPreparedCliRunContext({
+        output: "text",
+        provider: "fixture-cli",
+        runId: "overlap-first",
+      });
+      const second = buildPreparedCliRunContext({
+        output: "text",
+        provider: "fixture-cli",
+        runId: "overlap-second",
+      });
+      for (const context of [first, second]) {
+        context.preparedBackend.backend.serialize = false;
+      }
+      const firstOwner = createDiagnosticEmbeddedRunOwner(first.params);
+      const secondOwner = createDiagnosticEmbeddedRunOwner(second.params);
+      first.params.diagnosticOwner = firstOwner;
+      second.params.diagnosticOwner = secondOwner;
+      const firstHeld = holdSupervisorRun();
+      const secondHeld = holdSupervisorRun();
+      markDiagnosticEmbeddedRunStarted({ ...first.params, owner: firstOwner });
+      const runs = [executePreparedCliRun(first)];
+      try {
+        await firstHeld.entered;
+        now += 100;
+        markDiagnosticEmbeddedRunStarted({
+          ...second.params,
+          owner: secondOwner,
+        });
+        runs.push(executePreparedCliRun(second));
+        await secondHeld.entered;
+        const secondInput = requireSupervisorSpawnInput(1);
+        const quietMs = secondInput.noOutputTimeoutMs;
+        if (quietMs === undefined) {
+          throw new Error("Expected the second CLI child's quiet timeout");
+        }
+        const deadline = now + quietMs;
+        expect(getDiagnosticSessionActivitySnapshot(second.params)).toMatchObject({
+          activeBackendLivenessDeadlineAtMs: deadline,
+        });
+
+        requireSupervisorSpawnInput().onStdout?.("first");
+        firstHeld.release();
+        await expect(runs[0]).resolves.toMatchObject({ text: "first" });
+        closeDiagnosticEmbeddedRunOwner(firstOwner);
+        await waitForDiagnosticEventsDrained();
+        expect(getDiagnosticSessionActivitySnapshot(second.params)).toMatchObject({
+          hasActiveEmbeddedRun: true,
+          activeBackendLivenessDeadlineAtMs: deadline,
+        });
+
+        secondInput.onStdout?.("second");
+        secondHeld.release();
+        await expect(runs[1]).resolves.toMatchObject({ text: "second" });
+      } finally {
+        firstHeld.release();
+        secondHeld.release();
+        await Promise.allSettled(runs);
+        closeDiagnosticEmbeddedRunOwner(firstOwner);
+        closeDiagnosticEmbeddedRunOwner(secondOwner);
         clock.mockRestore();
       }
     });
